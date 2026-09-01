@@ -53,8 +53,9 @@ const CFG = {
   weave:      0.26,   // síla pleteniny v normálové mapě
   silh:       0.030,
   hem:        0.100,  // obroubená hrana: o kolik obě poloviny přejdou přes obrys  // rozvlnění obrysu, hlavně lemu a rukávů
-  thru:       0.035,   // prosvícení bavlny sluncem zezadu
-  rim:        0.055,  // světlo z oblohy na vlasu látky po obrysu
+  thru:       0.055,  // prosvícení bavlny sluncem zezadu
+  sunRim:     0.70,   // slunce obtahující hranu látky proti světlu
+  rim:        0.085,  // světlo z oblohy na vlasu látky po obrysu
   exposure:   1.15,
   blurNear:   16.0,   // rozostření popředí v pixelech při výšce okna 750
   blurFar:    5.5,    // rozostření pozadí
@@ -86,7 +87,7 @@ const FOG_COLOR = 0x2f86c4;
 
 /* Slunce potřebuje znát i obloha, aby na správném místě zesvětlala,
    a stín, aby ležel na odvrácené straně. Proto je pozice tady. */
-const SUN_POS = new THREE.Vector3(-7, 2.6, -9);
+const SUN_POS = new THREE.Vector3(-7.5, 4.0, -9);
 
 const FOG_HEX = '#eef1ee';
 
@@ -135,8 +136,8 @@ function backdrop(horizon) {
   const sp = SUN_POS.clone().normalize().multiplyScalar(1e5).project(camera);
   const sx = (sp.x * 0.5 + 0.5) * W, sy = (1 - (sp.y * 0.5 + 0.5)) * H;
   const halo = x.createRadialGradient(sx, sy, 0, sx, sy, H * 0.62);
-  halo.addColorStop(0.00, 'rgba(255,244,222,0.85)');
-  halo.addColorStop(0.35, 'rgba(255,240,216,0.32)');
+  halo.addColorStop(0.00, 'rgba(255,243,216,0.95)');
+  halo.addColorStop(0.35, 'rgba(255,238,210,0.40)');
   halo.addColorStop(1.00, 'rgba(255,238,214,0)');
   x.save();
   x.beginPath(); x.rect(0, 0, W, Math.ceil(flat * H)); x.clip();
@@ -618,8 +619,10 @@ function shellMaterial(sign, tex, drape) {
     shader.uniforms.uHem    = { value: CFG.hem };
     shader.uniforms.uThru   = { value: CFG.thru };
     shader.uniforms.uRim    = { value: CFG.rim };
+    shader.uniforms.uSunRim = { value: CFG.sunRim };
     shader.uniforms.uThruColor = { value: new THREE.Color(0x8a6a4a) };
     shader.uniforms.uRimColor  = { value: new THREE.Color(0x9fb4c4) };
+    shader.uniforms.uSunRimColor = { value: new THREE.Color(0xffd9a0) };
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `
@@ -703,8 +706,8 @@ function shellMaterial(sign, tex, drape) {
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `
         #include <common>
-        uniform vec3 uThruColor, uRimColor;
-        uniform float uThru, uRim;
+        uniform vec3 uThruColor, uRimColor, uSunRimColor;
+        uniform float uThru, uRim, uSunRim;
         varying float vThick;
       `)
       .replace('#include <lights_physical_fragment>', `
@@ -735,9 +738,24 @@ function shellMaterial(sign, tex, drape) {
                      * smoothstep(0.0, 0.10, vThick);
           outgoingLight += uThruColor * directionalLights[0].color * thru * uThru;
         #endif
-        /* Obrysové světlo přichází z oblohy, tedy shora. Kdyby se
-           přičítalo do všech stran, ohoří po bocích trička světlý
-           lem, který při otočení vypadá jako plastová hrana.        */
+        /* Obtažená hrana. Tohle na černé bavlně v protisvětle rozhoduje
+           o všem: kde se plocha stáčí od oka pryč a zároveň natáčí ke
+           slunci, projde vlasem látky světlo a obrys se rozsvítí. Bez
+           toho je tričko placatá silueta, ať má záhybů kolik chce.
+           Násobí se tím, jak moc je ta strana ke slunci, takže se
+           rozsvítí rameno a rukáv vlevo nahoře, ne celý obvod.        */
+        #if NUM_DIR_LIGHTS > 0
+          // nižší mocnina = širší a měkčí obtažení; ostrý drátek po obrysu
+          // vypadá jako plast, vlas bavlny světlo rozptýlí do šířky
+          float edge = pow(1.0 - clamp(abs(dot(normal, Vv)), 0.0, 1.0), 1.9);
+          float toSun = clamp(dot(normal, normalize(directionalLights[0].direction)), 0.0, 1.0);
+          outgoingLight += uSunRimColor * directionalLights[0].color
+                         * edge * toSun * uSunRim;
+        #endif
+
+        /* Slabší obrys z oblohy, ten přichází shora. Kdyby se přičítal
+           do všech stran, ohoří po bocích trička světlý lem, který při
+           otočení vypadá jako plastová hrana.                         */
         vec3 upV = normalize((viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
         float rim = pow(1.0 - clamp(abs(dot(normal, Vv)), 0.0, 1.0), 3.2)
                   * clamp(dot(normal, upV) * 0.5 + 0.5, 0.0, 1.0);
@@ -1120,13 +1138,17 @@ const sun = new THREE.DirectionalLight(0xffe0b0, 2.2);
 sun.position.copy(SUN_POS);
 scene.add(sun);
 
-scene.add(new THREE.HemisphereLight(0xdfe8ea, 0x3c4a26, 0.38));
+/* Spodní polokoule nesmí být barva hlíny. Země je tady bílý opar a
+   ten svítí nahoru skoro jako obloha — proto se tričku i stéblům
+   rozsvítí spodek. S tmavě olivovou zdola visel předmět v prázdnu.  */
+scene.add(new THREE.HemisphereLight(0xdfe8ea, 0xb4bdb0, 0.46));
 
-const key = new THREE.DirectionalLight(0xfff6e8, 0.25);
+// slabé přisvětlení od oka, jen aby černá nebyla úplně bez kresby
+const key = new THREE.DirectionalLight(0xfff6e8, 0.22);
 key.position.set(3, 5, 6);
 scene.add(key);
 
-scene.add(new THREE.AmbientLight(0xd8e2e6, 0.08));
+scene.add(new THREE.AmbientLight(0xd8e2e6, 0.06));
 
 /* --------------------- ovládání myší --------------------------- */
 /* Tričko má obě strany, tak se smí otočit dokola. Z boku je z plochého
@@ -1313,7 +1335,7 @@ try {
             vec2 off = vec2(cos(a), sin(a)) * uRes.y * 0.020;
             glow += max(texture(tScene, vUv + off * uPixel).rgb - 0.80, 0.0);
           }
-          col += glow * 0.075;
+          col += glow * 0.105;
 
           // vlastní barevná vada objektivu, znatelná jen u krajů
           float rr = length(vUv - 0.5);
@@ -1322,7 +1344,14 @@ try {
           col.b = mix(col.b, texture(tScene, vUv - ca).b, 0.55);
 
           // mírná esíčková křivka: film nikdy nekreslí přechody lineárně
-          col = mix(col, col * col * (3.0 - 2.0 * col), 0.10);
+          col = mix(col, col * col * (3.0 - 2.0 * col), 0.15);
+
+          /* Rozdělení tónů. Ranní protisvětlo je teplé a stíny pod ním
+             studené; když se to nechá neutrální, obraz je popisný, ale
+             mrtvý. Stačí procenta, víc už je pohlednice.               */
+          float tl = dot(col, vec3(0.2126, 0.7152, 0.0722));
+          col *= mix(vec3(0.970, 0.994, 1.038), vec3(1.034, 1.006, 0.962),
+                     smoothstep(0.12, 0.88, tl));
 
           col *= 1.0 - uVig * pow(clamp(rr * 1.42, 0.0, 1.0), 2.6);
 
