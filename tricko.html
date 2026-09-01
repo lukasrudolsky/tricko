@@ -52,7 +52,7 @@ const CFG = {
   drape:      0.105,  // hloubka skutečného splývání vytaženého z fotky
   weave:      0.26,   // síla pleteniny v normálové mapě
   silh:       0.030,
-  lap:        0.014,  // přesah skořepin u obrysu, aby se z profilu potkaly  // rozvlnění obrysu, hlavně lemu a rukávů
+  lap:        0.080,  // přesah skořepin u obrysu, aby se z profilu potkaly  // rozvlnění obrysu, hlavně lemu a rukávů
   thru:       0.035,   // prosvícení bavlny sluncem zezadu
   rim:        0.055,  // světlo z oblohy na vlasu látky po obrysu
   exposure:   1.15,
@@ -567,7 +567,7 @@ const frontTex = loader.load(SHIRT_FRONT_SRC, fitShirt);
 frontTex.colorSpace = THREE.SRGBColorSpace;
 frontTex.anisotropy = shirtTex.anisotropy;
 
-const heightTex = loader.load(HEIGHT_SRC);   // data, ne barva: bez sRGB převodu
+const heightTex = loader.load(HEIGHT_SRC, fitShirt);   // data, ne barva: bez sRGB převodu
 heightTex.minFilter = THREE.LinearFilter;
 heightTex.magFilter = THREE.LinearFilter;
 heightTex.generateMipmaps = false;
@@ -776,19 +776,92 @@ const backPanel  = shell( 1, shirtTex, drapeU);
 const frontPanel = shell(-1, frontTex, drapeFrontU);
 
 /* Výplň. Obě skořepiny se u obrysu sbíhají do nuly, takže tam leží
-   tečně ke směru pohledu — a z profilu mezi nimi prosvítá pozadí jako
-   bílá nitka: trojúhelníky u lemu jsou v tom natočení tenčí než pixel
-   a rastrování je občas mine. Plochý díl uprostřed tu skulinu vyplní
-   při každém natočení kromě přesného profilu, kde je stejně tenký i
-   zbytek. Je o kousek menší, aby nikde nevykoukl přes obrys.        */
-const lining = new THREE.Mesh(
-  new THREE.PlaneGeometry(CFG.width * 0.985, CFG.width * 0.985),
-  new THREE.MeshBasicMaterial({
-    map: shirtTex, transparent: true, alphaTest: 0.5,
-    side: THREE.DoubleSide, color: 0x23272a
-  })
+   tečně ke směru pohledu — trojúhelníky u lemu jsou v takovém natočení
+   tenčí než pixel a rastrování je občas mine. Mezi díly pak prosvítá
+   pozadí.
+
+   Plochý díl uprostřed to zavře skoro všude, jenže právě v profilu
+   zmizí do ostří stejně jako skořepiny. Druhá výplň proto stojí na
+   něm napříč, v rovině svislé a hloubkové osy: v profilu je čelem k
+   oku a skulinu překryje, zatímco zepředu se ztratí do ostří a schová
+   se pod přední skořepinou. Dohromady je zakryté každé natočení.
+
+   Její tvar musí kopírovat, jak je tričko v které výšce nafouklé —
+   nahoře u límce a dole u lemu je tenké a rovný obdélník by odtamtud
+   vykoukl. Výška se čte z výškové mapy, řádek po řádku, a bere se z ní
+   jen část, aby výplň zůstala schovaná uvnitř.                       */
+const liningMat = new THREE.MeshBasicMaterial({
+  map: shirtTex, transparent: true, alphaTest: 0.5,
+  side: THREE.DoubleSide, color: 0x23272a
+});
+const lining = new THREE.Mesh(new THREE.PlaneGeometry(CFG.width * 0.985, CFG.width * 0.985), liningMat);
+
+const spine = new THREE.Mesh(
+  new THREE.BufferGeometry(),
+  new THREE.MeshBasicMaterial({ color: 0x1b1e21, side: THREE.DoubleSide })
 );
-logo.add(lining, backPanel, frontPanel);
+spine.visible = false;
+
+function buildSpine(hh) {
+  const hm = heightTex.image, cm = shirtTex.image;
+  if (!hm || !hm.width || !cm || !cm.width) return;
+  const S = 160;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const x = c.getContext('2d', { willReadFrequently: true });
+
+  x.drawImage(hm, 0, 0, S, S);
+  const hd = x.getImageData(0, 0, S, S).data;
+  x.clearRect(0, 0, S, S);
+  x.drawImage(cm, 0, 0, S, S);
+  const cd = x.getImageData(0, 0, S, S).data;
+
+  /* Kam až díl sahá, se čte z průhlednosti, ne z výškové mapy: ta je
+     u obrysu nulová, takže by výplň skončila o kus níž než skořepiny
+     a nahoře u límce by mezi nimi zůstal klínek oblohy. Maska se ještě
+     roztáhne o pár řádků, aby ji nerozbil jeden nepovedený.           */
+  const inside = new Uint8Array(S);
+  const peak = new Float32Array(S);
+  for (let j = 0; j < S; j++) {
+    let m = 0;
+    for (let i = 0; i < S; i++) {
+      m = Math.max(m, hd[(j * S + i) * 4] / 255);
+      if (cd[(j * S + i) * 4 + 3] > 8) inside[j] = 1;
+    }
+    peak[j] = m;
+  }
+  const wide = new Uint8Array(S);
+  for (let j = 0; j < S; j++)
+    for (let k = -3; k <= 3; k++)
+      if (inside[Math.min(S - 1, Math.max(0, j + k))]) wide[j] = 1;
+
+  const pos = [];
+  for (let j = 0; j < S; j++) {
+    // maximum ze sousedních řádků: kde je díl na jednom řádku tenký,
+    // třeba u límce, podrží výplň jeho okolí
+    let m = 0;
+    for (let k = -3; k <= 3; k++) m = Math.max(m, peak[Math.min(S - 1, Math.max(0, j + k))]);
+    /* Spodní mez je stejná jako přesah skořepin: o tolik je díl silný i
+       u samotného lemu, takže se výplň nikdy neprodere ven.            */
+    const z = wide[j] ? Math.max(CFG.lap, 0.70 * CFG.puff * Math.pow(m, 1.15)) : 0;
+    // řádek 0 plátna je horní okraj obrázku, tedy horní okraj dílu
+    const y = hh * (0.5 - j / (S - 1));
+    pos.push(0, y, z, 0, y, -z);
+  }
+  const idx = [];
+  for (let j = 0; j < S - 1; j++) {
+    const a = j * 2;
+    idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  spine.geometry.dispose();
+  spine.geometry = g;
+  spine.visible = true;
+}
+
+logo.add(lining, spine, backPanel, frontPanel);
 scene.add(logo);
 
 /* Volá se za každou načtenou fotku zvlášť, tak si každá část hlídá,
@@ -811,6 +884,7 @@ function fitShirt() {
   }
   lining.geometry.dispose();
   lining.geometry = new THREE.PlaneGeometry(CFG.width * 0.985, hh * 0.985);
+  buildSpine(hh);
   sizeU.value.set(CFG.width, hh);
 }
 
