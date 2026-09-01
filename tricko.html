@@ -1251,7 +1251,9 @@ try {
       uGrain:   { value: CFG.grain },
       uVig:     { value: CFG.vignette },
       uTime:    { value: 0 },
-      uTaps:    { value: innerWidth < 700 ? 8 : 22 }    // na mobilu levněji
+      uTaps:    { value: innerWidth < 700 ? 8 : 22 },   // na mobilu levněji
+      uSS:      { value: 1 },
+      uAA:      { value: innerWidth < 700 ? 0 : 1 }   // na mobilu hrany takhle nevystoupí
     };
 
     const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.RawShaderMaterial({
@@ -1270,7 +1272,7 @@ try {
         out vec4 fragColor;
         uniform sampler2D tScene, tDepth;
         uniform vec2 uPixel, uRes, uNearFar, uBlur;
-        uniform float uFocus, uGrain, uVig, uTime;
+        uniform float uFocus, uGrain, uVig, uTime, uSS, uAA;
         uniform int uTaps;
 
         // hloubka z depth bufferu na vzdálenost od kamery v metrech
@@ -1292,6 +1294,55 @@ try {
         }
         float coc(vec2 uv) { return abs(cocSigned(uv)); }
 
+        /* Sesbírání přesahu rozlišení. Scéna se kreslí do větší textury,
+           jenže jeden vzorek z ní celý ten přesah zahodí — vezme jen
+           bod, kam zrovna padne, a hrana zůstane stejně schodovitá,
+           jako by se kreslilo rovnou na plátno. Čtyři vzorky rozházené
+           po ploše výsledného pixelu je teprve zprůměrují, a natočené
+           mimo osy proto, aby na svislé a vodorovné hraně vyšly různé
+           mezistupně, ne jeden.                                        */
+        vec3 resolve(vec2 uv) {
+          vec2 o = uPixel * uSS * 0.25;
+          return 0.25 * (texture(tScene, uv + vec2( 1.0,  0.33) * o).rgb
+                       + texture(tScene, uv + vec2(-0.33, 1.0 ) * o).rgb
+                       + texture(tScene, uv + vec2(-1.0, -0.33) * o).rgb
+                       + texture(tScene, uv + vec2( 0.33, -1.0) * o).rgb);
+        }
+
+        /* Dohlazení hran. Přesah rozlišení dá na jeden výsledný pixel
+           necelé tři vzorky scény, takže šikmá hrana z něj vyjde nejvýš
+           na čtyři mezistupně a schody jsou pořád znát. Tohle je najde
+           podle rozdílu jasu mezi rohy, odhadne, kudy hrana vede, a
+           rozmaže výsledek podél ní — ne napříč, tam by se ztratila
+           kresba. Poslední pojistka drží výsledek v rozsahu okolí, aby
+           to nikde nepřestřelilo do světlého ani tmavého.              */
+        float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+        vec3 antialias(vec2 uv) {
+          vec3 mid = resolve(uv);
+          if (uAA < 0.5) return mid;
+          vec2 px = uPixel * uSS;
+          float lM = luma(mid);
+          float lNW = luma(texture(tScene, uv + vec2(-0.5, -0.5) * px).rgb);
+          float lNE = luma(texture(tScene, uv + vec2( 0.5, -0.5) * px).rgb);
+          float lSW = luma(texture(tScene, uv + vec2(-0.5,  0.5) * px).rgb);
+          float lSE = luma(texture(tScene, uv + vec2( 0.5,  0.5) * px).rgb);
+          float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+          float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+          if (lMax - lMin < max(0.028, lMax * 0.11)) return mid;
+
+          vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+          float red = max((lNW + lNE + lSW + lSE) * 0.25 * 0.16, 1.0 / 64.0);
+          float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + red);
+          dir = clamp(dir * rcp, -3.0, 3.0) * px;
+
+          vec3 a = 0.5 * (resolve(uv + dir * (1.0 / 3.0 - 0.5))
+                        + resolve(uv + dir * (2.0 / 3.0 - 0.5)));
+          vec3 b = a * 0.5 + 0.25 * (resolve(uv - dir * 0.5) + resolve(uv + dir * 0.5));
+          float lB = luma(b);
+          return (lB < lMin || lB > lMax) ? a : b;
+        }
+
         float hash12(vec2 p) {
           vec3 q = fract(vec3(p.xyx) * 0.1031);
           q += dot(q, q.yzx + 33.33);
@@ -1299,7 +1350,7 @@ try {
         }
 
         void main() {
-          vec3 base = texture(tScene, vUv).rgb;
+          vec3 base = antialias(vUv);
           float r = coc(vUv);
 
           /* Hloubka ostrosti. Sbírá se po spirále a každý vzorek se
@@ -1381,9 +1432,10 @@ try {
            zmenšení při skládání hrany posbírá. Nad rozumný počet
            pixelů se přesah pouští, jinak by to na velkém displeji
            bylo dražší, než je nutné.                                  */
-        const ss = Math.max(1, Math.min(1.6, Math.sqrt(7.5e6 / Math.max(1, w * h))));
+        const ss = Math.max(1, Math.min(1.75, Math.sqrt(12e6 / Math.max(1, w * h))));
         const rw = Math.round(w * ss), rh = Math.round(h * ss);
         rt.setSize(rw, rh);
+        uni.uSS.value = ss;
         uni.uPixel.value.set(1 / rw, 1 / rh);
         uni.uRes.value.set(rw, rh);
         uni.uNearFar.value.set(camera.near, camera.far);
