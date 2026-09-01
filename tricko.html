@@ -57,8 +57,8 @@ const CFG = {
   sunRim:     0.70,   // slunce obtahující hranu látky proti světlu
   rim:        0.085,  // světlo z oblohy na vlasu látky po obrysu
   exposure:   1.15,
-  blurNear:   16.0,   // rozostření popředí v pixelech při výšce okna 750
-  blurFar:    5.5,    // rozostření pozadí
+  blurNear:   7.5,    // rozostření popředí v pixelech při výšce okna 750
+  blurFar:    3.0,    // rozostření pozadí
   grain:      0.020,  // zrno
   vignette:   0.26,
   cloudCover: 0.50,   // kolik oblohy oblaka zaberou, výš je míň
@@ -820,7 +820,7 @@ function fitShirt() {
 /* --------------------------- louka ------------------------------ */
 const GROUND_Y = -1.90;
 const BLADE_H  = 0.72;
-const BLADES   = innerWidth < 700 ? 36000 : 88000;
+const BLADES   = innerWidth < 700 ? 30000 : 64000;
 const FLOWERS  = 1200;
 
 scene.fog = new THREE.Fog(new THREE.Color(FOG_HEX), 12, 30);
@@ -887,7 +887,7 @@ soilMat.onBeforeCompile = (shader) => {
       vec2 sd = vXZ - uShadow.zw;
       sd = vec2(dot(sd, uShadowAxis) / 1.55, dot(sd, vec2(-uShadowAxis.y, uShadowAxis.x)));
       outgoingLight *= 1.0 - uShadow.y * (1.0 - smoothstep(0.0, uShadow.x, length(sd)));
-      outgoingLight = mix(outgoingLight, uHaze, smoothstep(9.0, 34.0, vFogDepth) * 0.66);
+      outgoingLight = mix(outgoingLight, uHaze, smoothstep(9.0, 34.0, vFogDepth) * 0.56);
       #include <opaque_fragment>
     `);
 };
@@ -1006,7 +1006,7 @@ grassMat.onBeforeCompile = (shader) => {
          zamlžila i jeho, ale louka se musí ztrácet mnohem dřív —
          bez toho je pás trávy stejně sytý u nohou i na obzoru.       */
       outgoingLight = mix(outgoingLight, uHaze,
-                          smoothstep(9.0, 34.0, vFogDepth) * 0.66);
+                          smoothstep(9.0, 34.0, vFogDepth) * 0.56);
       #include <opaque_fragment>
     `);
   shader.uniforms.uTrans = { value: 1.15 };
@@ -1251,7 +1251,7 @@ try {
       uGrain:   { value: CFG.grain },
       uVig:     { value: CFG.vignette },
       uTime:    { value: 0 },
-      uTaps:    { value: innerWidth < 700 ? 8 : 22 },   // na mobilu levněji
+      uTaps:    { value: 12 },   // přepisuje se podle naměřené rychlosti
       uSS:      { value: 1 },
       uAA:      { value: innerWidth < 700 ? 0 : 1 }   // na mobilu hrany takhle nevystoupí
     };
@@ -1360,8 +1360,12 @@ try {
           vec3 sum = base;
           float wsum = 1.0;
           if (r > 0.6) {
-            float N = float(uTaps);
-            for (int i = 0; i < uTaps; i++) {
+            /* Počet vzorků podle poloměru. Většina obrazu je rozostřená
+               jen mírně a plný počet je tam vyhozený výkon — sbírat
+               dvanáct vzorků do kroužku o dvou pixelech nemá smysl.    */
+            int n = int(clamp(r * 1.7, 4.0, float(uTaps)));
+            float N = float(n);
+            for (int i = 0; i < n; i++) {
               float fi = float(i) + 0.5;
               float a = fi * 2.39996323;                    // zlatý úhel
               float rad = r * sqrt(fi / N);
@@ -1381,12 +1385,12 @@ try {
           /* Rozpití světel. Protisvětlo se v objektivu roztéká přes
              hrany, opar musí do trávy a do trička trochu vtéct.       */
           vec3 glow = vec3(0.0);
-          for (int i = 0; i < 8; i++) {
-            float a = float(i) * 0.7853981 + 0.4;
+          for (int i = 0; i < 4; i++) {
+            float a = float(i) * 1.5707963 + 0.4;
             vec2 off = vec2(cos(a), sin(a)) * uRes.y * 0.020;
             glow += max(texture(tScene, vUv + off * uPixel).rgb - 0.80, 0.0);
           }
-          col += glow * 0.105;
+          col += glow * 0.21;
 
           // vlastní barevná vada objektivu, znatelná jen u krajů
           float rr = length(vUv - 0.5);
@@ -1425,14 +1429,17 @@ try {
 
     post = {
       rt, uni,
+      ssCap: 1.45, lastW: 1, lastH: 1,
+      taps(n) { uni.uTaps.value = n; },
       resize(w, h) {
+        post.lastW = w; post.lastH = h;
         /* Vyhlazení hran. Vícenásobné vzorkování se do textury s
            hotovým obrazem přenést nedá — formáty se při slučování
            neshodnou — takže se scéna kreslí s přesahem rozlišení a
            zmenšení při skládání hrany posbírá. Nad rozumný počet
            pixelů se přesah pouští, jinak by to na velkém displeji
            bylo dražší, než je nutné.                                  */
-        const ss = Math.max(1, Math.min(1.75, Math.sqrt(12e6 / Math.max(1, w * h))));
+        const ss = Math.max(1, Math.min(post.ssCap, Math.sqrt(5.5e6 / Math.max(1, w * h))));
         const rw = Math.round(w * ss), rh = Math.round(h * ss);
         rt.setSize(rw, rh);
         uni.uSS.value = ss;
@@ -1454,6 +1461,59 @@ try {
   post = null;
 }
 
+/* ------------------ samočinné ubírání kvality --------------------
+   Kolik stroj unese, se odsud odhadnout nedá: stejná stránka běží na
+   herní grafice i na integrované v notebooku. Místo hádání se měří,
+   jak dlouho trvá snímek, a když se scéna nestíhá, ubere se — nejdřív
+   přesah rozlišení a vzorky rozostření, pak hustota trávy. Zpátky se
+   nepřidává, jinak by kvalita blikala sem a tam na hraně únosnosti.  */
+const QUALITY = [
+  { ss: 1.45, taps: 12, blades: 1.00 },
+  { ss: 1.15, taps: 8,  blades: 0.70 },
+  { ss: 1.00, taps: 6,  blades: 0.48 }
+];
+let qLevel = (typeof window.__fixedQuality === 'number') ? window.__fixedQuality
+           : (innerWidth < 700 ? 1 : 0);
+const qFixed = typeof window.__fixedQuality === 'number';
+
+function applyQuality() {
+  const q = QUALITY[qLevel];
+  grass.count = Math.round(BLADES * q.blades);
+  if (post) {
+    post.ssCap = q.ss;
+    post.taps(innerWidth < 700 ? Math.min(6, q.taps) : q.taps);
+    if (post.lastW > 1) post.resize(post.lastW, post.lastH);
+  }
+}
+applyQuality();
+
+let qSum = 0, qFrames = 0, qBad = 0, qLast = performance.now(), qStart = qLast;
+/* Přepnutí na jinou záložku zastaví kreslení a udělalo by z toho jeden
+   nekonečně dlouhý snímek. Měření se proto při každé změně viditelnosti
+   zahodí, místo aby se dlouhý výpadek hádal z jeho délky.             */
+document.addEventListener('visibilitychange', () => {
+  qSum = 0; qFrames = 0; qLast = performance.now();
+});
+function watchSpeed() {
+  const now = performance.now();
+  const ms = now - qLast;
+  qLast = now;
+  if (qFixed || qLevel >= QUALITY.length - 1) return;
+  // první chvíli se překládají shadery, to by měřením neprošlo
+  if (now - qStart < 1500) return;
+  if (document.hidden || ms > 5000) { qSum = 0; qFrames = 0; return; }
+  qSum += ms; qFrames++;
+  if (qSum > 1500) {
+    /* Rozhoduje průměr snímku, ne počet pomalých: na opravdu vytížené
+       grafice jich za okno proběhne jen pár a počítání by je přehlédlo.
+       Ubere se až po dvou špatných oknech za sebou, ať to nespadne kvůli
+       jednomu zádrhelu.                                                */
+    qBad = (qSum / qFrames > 24) ? qBad + 1 : 0;
+    if (qBad >= 2) { qLevel++; applyQuality(); qBad = 0; }
+    qSum = 0; qFrames = 0;
+  }
+}
+
 /* ------------------------- animace ----------------------------- */
 const clock = new THREE.Clock();
 const smoothstep = (e0, e1, x) => {
@@ -1466,6 +1526,7 @@ window.__dbg = { scene, camera, THREE };
 window.__setAngle = (a) => { rotY = a; rotX = 0; velY = velX = 0; frozen = true; };
 
 function frame() {
+  watchSpeed();
   const dt = Math.min(clock.getDelta(), 0.05);
   const t = clock.getElapsedTime();
 
