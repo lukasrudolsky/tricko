@@ -58,7 +58,10 @@ const CFG = {
   blurNear:   16.0,   // rozostření popředí v pixelech při výšce okna 750
   blurFar:    5.5,    // rozostření pozadí
   grain:      0.020,  // zrno
-  vignette:   0.26
+  vignette:   0.26,
+  cloudCover: 0.50,   // kolik oblohy oblaka zaberou, výš je míň
+  cloudScale: 1.00,   // velikost útvarů
+  cloudAlpha: 0.92
 };
 
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -94,7 +97,7 @@ const HAZE_HEX = '#dfe5dc';
    nanáší až po tone mappingu, takže dole vyjde přesně FOG_HEX, a aby
    na hraně země nebyl schod, musí tam obloha končit stejnou barvou.  */
 function backdrop(horizon) {
-  const W = 256, H = 512;
+  const W = 512, H = 1024;
   const hz = Number.isFinite(horizon) ? Math.max(0.06, Math.min(0.94, horizon)) : 0.25;
   const flat = Math.max(0, hz - 0.05);            // plochý pás těsně nad obzorem
 
@@ -158,33 +161,92 @@ function backdrop(horizon) {
   }
   x.restore();
 
-  /* Oblačnost. Čistý přechod nemá obloha nikdy, a i slabý mrak dá
-     obrazu měřítko. Kreslí se po pixelech, protože jde o šum, ne o
-     tvar, a drží se nahoře — dole ji stejně spolkne opar.             */
+  /* Oblačnost. Kdyby se šum jen roztáhl přes oblohu, budou oblaka u
+     obzoru stejně velká jako nad hlavou — a přesně tím se pozná
+     namalované pozadí. Skutečná oblaka leží v jedné výšce a s
+     odstupem se sráží k sobě, až u obzoru splynou v pruh. Proto se
+     pro každý pixel spočítá, kam jeho paprsek do té výšky dopadne, a
+     šum se vzorkuje až tam. Blízko nad hlavou vyjde široký útvar, u
+     obzoru pár pixelů.
+
+     Stínování je taky z toho šumu: vzorek posunutý směrem ke slunci
+     řekne, jestli je tohle místo z pohledu slunce nahoře nebo v
+     závětří, a podle toho se míchá teplý vrch se studeným spodkem.   */
   {
-    const CW = 112, CH = 168;
+    const skyH = Math.ceil(flat * H);
+    /* Vrstva se počítá na polovičním rozlišení. Šum na každý pixel je
+       to nejdražší v celé přípravě oblohy a měkkým oblakům zvětšení
+       neublíží — spíš pomůže.                                        */
+    const CW = W >> 1, CH = skyH >> 1;
+    const tanHalf = Math.tan(camera.fov * Math.PI / 360);
+    const asp = camera.aspect;
+    const F = CFG.cloudScale;
+
+    /* Detail se se vzdáleností ubírá. Blíž k obzoru padne na jeden
+       pixel čím dál větší kus vrstvy, a kdyby se drobné oktávy počítaly
+       dál, začnou se vzorkovat řidčeji, než jak se mění — z toho vznikne
+       falešné pruhování, jako by se oblaka u obzoru zrcadlila. Váhy se
+       přitom musí dopočítat, jinak by s ubývajícím detailem klesl i
+       průměr a oblaka by se do dálky vytrácela.                        */
+    const fbm = (a, b, det) => {
+      const w3 = 0.14 * det, w4 = 0.06 * det * det;
+      return (noise2(a, b) * 0.53
+            + noise2(a * 2.03 + 7.1, b * 2.03 + 3.7) * 0.27
+            + noise2(a * 4.11 + 13.3, b * 4.11 + 9.1) * w3
+            + noise2(a * 8.30 + 21.7, b * 8.30 + 17.5) * w4) / (0.80 + w3 + w4);
+    };
+
+    // vodorovný směr ke slunci, po něm se hledá osvětlená strana
+    const sdx = Math.sign(-SUN_POS.x) || 1, sdz = Math.sign(-SUN_POS.z) || -1;
+
     const cl = x.createImageData(CW, CH);
     for (let yy = 0; yy < CH; yy++) {
-      const vy = yy / CH;
-      const fade = Math.max(0, Math.min(1, (0.92 - vy) / 0.55)) * Math.min(1, vy / 0.10);
+      const v = (yy * 2) / H;
+      const te = Math.max(1e-4, (hz - v) * 2 * tanHalf);   // tangens výšky nad obzorem
+      const dist = 1 / te;                                  // vrstva je ve výšce 1
+      // opar: co je daleko, ztrácí kontrast, a nakonec i sebe
+      const haze = Math.max(0, Math.min(1, 1 - (dist - 5) / 12));
+      const det = Math.max(0, Math.min(1, 1 - (dist - 4) / 8));
+      if (haze <= 0) continue;
       for (let xx = 0; xx < CW; xx++) {
-        const u = xx / CW * 6.2, w2 = vy * 3.4;
-        let f = noise2(u, w2) * 0.55 + noise2(u * 2.3 + 4.1, w2 * 2.3) * 0.28
-              + noise2(u * 4.7 + 9.3, w2 * 4.7) * 0.17;
-        const a = Math.max(0, Math.min(1, (f - 0.52) * 3.6)) * fade;
+        const u = xx / CW;
+        const wx = (u - 0.5) * 2 * tanHalf * asp * dist;
+        const a1 = wx * F, b1 = dist * F;
+
+        // velký útvar rozhoduje, kde je jasno; bez něj je obloha
+        // rovnoměrně zatažená a nemá to řád
+        const mask = fbm(a1 * 0.26 - 5.0, b1 * 0.26 + 2.0, det);
+        const cover = CFG.cloudCover * (0.55 + 0.90 * mask);
+
+        /* Práh, ne násobení. Šum se drží kolem poloviny s rozptylem
+           kolem 0.13, takže o tom, kolik oblohy zaberou oblaka,
+           rozhoduje jen to, kde se řekne „odsud výš je mrak“.        */
+        const f = fbm(a1, b1, det);
+        const thr = 0.70 - 0.42 * cover;
+        let cov = (f - thr) / 0.07;
+        cov = cov <= 0 ? 0 : (cov >= 1 ? 1 : cov * cov * (3 - 2 * cov));
+        if (cov <= 0.002) continue;
+
+        const lit = fbm(a1 + sdx * 0.42, b1 + sdz * 0.42, det);
+        const sh = Math.max(0, Math.min(1, 0.5 + (lit - f) * 3.0));
+
+        /* Strana ke slunci je teplejší. Bez toho jsou oblaka všude
+           stejně studeně šedá a je znát, že je nic neosvětluje.       */
+        const warm = Math.max(0, 1 - Math.abs(xx * 2 - sx) / (W * 0.85));
+        const t = warm * (0.35 + 0.5 * sh);
+        const r = (196 + 59 * sh) + 46 * t;
+        const g = (202 + 51 * sh) + 30 * t;
+        const b = (210 + 39 * sh) + 4 * t;
         const k = (yy * CW + xx) * 4;
-        cl.data[k] = 255; cl.data[k + 1] = 253; cl.data[k + 2] = 250;
-        cl.data[k + 3] = Math.round(a * 78);
+        cl.data[k] = r; cl.data[k + 1] = g; cl.data[k + 2] = b;
+        cl.data[k + 3] = Math.round(cov * haze * CFG.cloudAlpha * 255);
       }
     }
     const cc = document.createElement('canvas');
     cc.width = CW; cc.height = CH;
     cc.getContext('2d').putImageData(cl, 0, 0);
-    x.save();
-    x.beginPath(); x.rect(0, 0, W, Math.ceil(flat * H)); x.clip();
     x.imageSmoothingEnabled = true;
-    x.drawImage(cc, 0, 0, W, Math.ceil(flat * H * 0.96));
-    x.restore();
+    x.drawImage(cc, 0, 0, W, skyH);
   }
 
   /* Vzdálená mez. Rozeznat se nedá skoro nic, ale bez jakéhokoli
