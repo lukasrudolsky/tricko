@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Louka</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  body {
+    background:
+      linear-gradient(180deg, #b9cfd8 0%, #d6e2e2 12%, #eef1ee 27%, #eef1ee 100%);
+    background-color: #06305e;
+  }
+  /* jemný tmavý vinětační přechod v pravém horním rohu, jako na předloze */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background: radial-gradient(90% 80% at 88% 4%, rgba(2,16,38,.55), rgba(2,16,38,0) 60%);
+    pointer-events: none;
+  }
+  canvas { position: fixed; inset: 0; display: block; }
+
+  @media (prefers-reduced-motion: reduce) {
+    /* vítr se v JS zastaví, tráva zůstane stát */
+  }
+</style>
+</head>
+<body>
+<script type="importmap">
+{ "imports": { "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.min.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ------------------------------------------------------------------
+   NASTAVENÍ
+------------------------------------------------------------------ */
+const CFG = {
+  exposure: 1.15
+};
+
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------------------------- scéna ---------------------------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = CFG.exposure;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+/* Pozadí je uvnitř scény, ne jen v CSS. Barva oblohy u obzoru musí
+   sedět na barvu mlhy, jinak je na okraji země vidět ostrá
+   vodorovná hrana.                                                 */
+const FOG_HEX = '#eef1ee';
+
+/* Obloha se kreslí podle toho, kde na obrazovce leží obzor. Mlha se
+   nanáší až po tone mappingu, takže dole vyjde přesně FOG_HEX, a aby
+   na hraně země nebyl schod, musí tam obloha končit stejnou barvou.  */
+function backdrop(horizon) {
+  const W = 256, H = 512;
+  const hz = Number.isFinite(horizon) ? Math.max(0.06, Math.min(0.94, horizon)) : 0.25;
+  const flat = Math.max(0, hz - 0.05);            // plochý pás těsně nad obzorem
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const x = c.getContext('2d');
+
+  const g = x.createLinearGradient(0, 0, 0, flat * H);
+  g.addColorStop(0.00, '#b9cfd8');
+  g.addColorStop(0.40, '#d6e2e2');
+  g.addColorStop(0.75, '#e7ecea');
+  g.addColorStop(1.00, FOG_HEX);
+  x.fillStyle = g;
+  x.fillRect(0, 0, W, Math.ceil(flat * H));
+
+  // prosvětlení vlevo, kreslené jen nad plochý pás, ať ho nezabarví
+  const glow = x.createRadialGradient(W * 0.28, flat * H * 0.55, 0, W * 0.28, flat * H * 0.55, W * 0.9);
+  glow.addColorStop(0, 'rgba(255,247,232,0.40)');
+  glow.addColorStop(1, 'rgba(255,247,232,0)');
+  x.fillStyle = glow;
+  x.fillRect(0, 0, W, Math.ceil(flat * H));
+
+  // prosvětlení se musí vytratit dřív, než pás začne, jinak vznikne
+  // schod přesně na jeho horní hraně
+  const fade = x.createLinearGradient(0, flat * H * 0.62, 0, flat * H);
+  fade.addColorStop(0, 'rgba(238,241,238,0)');
+  fade.addColorStop(1, 'rgba(238,241,238,1)');
+  x.fillStyle = fade;
+  x.fillRect(0, Math.floor(flat * H * 0.62), W, Math.ceil(flat * H * 0.38) + 2);
+
+  x.fillStyle = FOG_HEX;
+  x.fillRect(0, Math.ceil(flat * H) - 1, W, H);
+
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// kam na obrazovce padne obzor: bod nekonečně daleko ve vodorovném směru
+const _fwd = new THREE.Vector3(), _hz = new THREE.Vector3();
+function horizonFraction() {
+  camera.getWorldDirection(_fwd);
+  _hz.set(_fwd.x, 0, _fwd.z).normalize().multiplyScalar(1e6).add(camera.position).project(camera);
+  const f = (1 - _hz.y) / 2;
+  return Number.isFinite(f) ? f : 0.25;
+}
+
+function refreshSky() {
+  scene.background?.dispose?.();
+  scene.background = backdrop(horizonFraction());
+}
+
+const CAM_Z = 9.5;
+const camera = new THREE.PerspectiveCamera(26, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, -0.75, CAM_Z);
+
+/* ------------------- prostředí pro nasvícení --------------------
+   Studio: obloha nahoře, tmavá zem dole, několik softboxů. Slouží
+   jako měkké okolní světlo pro trávu a kvítka; bez něj je louka
+   znatelně tmavší. Kreslí se po pixelech, protože canvas fillRect
+   nechává na equirect mapě svislý šev na u = 0.                   */
+function envTexture() {
+  const W = 1024, H = 512;
+  const img = new ImageData(W, H);
+  const d = img.data;
+
+  const smooth = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+  const lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t,
+                              a[1] + (b[1] - a[1]) * t,
+                              a[2] + (b[2] - a[2]) * t];
+
+  const SKY_TOP  = [150, 192, 228];
+  const SKY_LOW  = [104, 152, 200];
+  const FLOOR_HI = [40,  84, 132];
+  const FLOOR_LO = [10,  32,  62];
+
+  // softboxy: u = azimut (obtéká dokola), v = výška
+  const panels = [
+    { u: 0.13, du: 0.21, v0: 0.02, v1: 0.60, soft: 0.070, i:  1.45 },
+    { u: 0.62, du: 0.17, v0: 0.04, v1: 0.56, soft: 0.070, i:  1.20 },
+    { u: 0.38, du: 0.05, v0: 0.00, v1: 0.52, soft: 0.090, i: -0.32 },
+    { u: 0.87, du: 0.05, v0: 0.00, v1: 0.52, soft: 0.090, i: -0.32 },
+    { u: 0.20, du: 0.16, v0: 0.60, v1: 0.90, soft: 0.100, i:  0.30 },
+    { u: 0.30, du: 0.012, v0: 0.05, v1: 0.62, soft: 0.012, i:  2.10 }   // úzký pruh: dělá ostrý blik na hraně
+  ];
+
+  for (let y = 0; y < H; y++) {
+    const v = y / (H - 1);
+    const sky   = lerp3(SKY_TOP, SKY_LOW, smooth(0, 0.48, v));
+    const floor = lerp3(FLOOR_HI, FLOOR_LO, smooth(0.5, 1, v));
+    const base  = lerp3(sky, floor, smooth(0.475, 0.525, v));   // horizont
+
+    for (let xp = 0; xp < W; xp++) {
+      const u = xp / W;
+      let add = 0;
+      for (const p of panels) {
+        let du = Math.abs(u - p.u);
+        if (du > 0.5) du = 1 - du;                              // přes šev
+        const mu = 1 - smooth(p.du, p.du + p.soft, du);
+        const mv = smooth(p.v0 - p.soft, p.v0 + p.soft, v) *
+                   (1 - smooth(p.v1 - p.soft, p.v1 + p.soft, v));
+        add += p.i * mu * mv;
+      }
+      const k = (xp + y * W) * 4;
+      d[k]     = Math.max(0, Math.min(255, base[0] + add * 130));
+      d[k + 1] = Math.max(0, Math.min(255, base[1] + add * 132));
+      d[k + 2] = Math.max(0, Math.min(255, base[2] + add * 135));
+      d[k + 3] = 255;
+    }
+  }
+
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  c.getContext('2d').putImageData(img, 0, 0);
+
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.RepeatWrapping;
+  t.minFilter = THREE.LinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.generateMipmaps = false;
+  return t;
+}
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+const envMap = pmrem.fromEquirectangular(envTexture()).texture;
+scene.environment = envMap;
+
+/* --------------------------- louka ------------------------------ */
+const GROUND_Y = -1.90;
+const BLADE_H  = 0.72;
+const BLADES   = innerWidth < 700 ? 32000 : 60000;
+const FLOWERS  = 900;
+
+scene.fog = new THREE.Fog(new THREE.Color(FOG_HEX), 12, 30);
+
+/* Terén: hodnotový šum. Stejná funkce posadí zem i každé stéblo,
+   takže tráva nikde nevisí ve vzduchu ani se nepropadá.            */
+function hash2(x, z) {
+  const s = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function noise2(x, z) {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash2(xi, zi),     b = hash2(xi + 1, zi);
+  const c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+  return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+}
+function rawTerrain(x, z) {
+  return (noise2(x * 0.021, z * 0.021) - 0.5) * 1.30
+       + (noise2(x * 0.055, z * 0.055) - 0.5) * 0.60
+       + (noise2(x * 0.17,  z * 0.17)  - 0.5) * 0.24
+       + (noise2(x * 0.52,  z * 0.52)  - 0.5) * 0.07;
+}
+/* Šum nemá střední hodnotu přesně 0.5, takže se terén jako celek
+   propadl pod GROUND_Y a tráva zmizela pod spodní hranou záběru.
+   Průměr si spočítáme a odečteme.                                  */
+const terrainBias = (() => {
+  let s = 0, n = 0;
+  for (let x = -34; x <= 34; x += 2) for (let z = -34; z <= 34; z += 2) { s += rawTerrain(x, z); n++; }
+  return s / n;
+})();
+/* Velké vlny krajiny přidáváme až s odstupem od kamery. Kdyby platily
+   i v popředí, mohl by se terén zvednout nad kameru a zakrýt scénu.   */
+function terrain(x, z) {
+  const d = Math.hypot(x, z - CAM_Z);
+  const w = Math.max(0, Math.min(1, (d - 9) / 20));
+  const swell = (noise2(x * 0.0085, z * 0.0085) - 0.5) * 4.5;
+  return rawTerrain(x, z) - terrainBias + swell * w * w;
+}
+
+// podklad, aby mezi stébly neprosvítala obloha
+const soilGeo = new THREE.PlaneGeometry(120, 120, 190, 190).rotateX(-Math.PI / 2);
+{
+  const pos = soilGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) pos.setY(i, terrain(pos.getX(i), pos.getZ(i)));
+  soilGeo.computeVertexNormals();
+}
+const soil = new THREE.Mesh(soilGeo, new THREE.MeshStandardMaterial({
+  color: 0x4a5a2c, roughness: 1, metalness: 0
+}));
+soil.position.y = GROUND_Y;
+scene.add(soil);
+
+// náhodný bod v zorném klínu kamery, s rezervou do stran
+function wedge() {
+  const d = 0.5 + Math.random() * 34;               // vzdálenost před kamerou
+  const half = 0.42 * d + 3;
+  return [(Math.random() - 0.5) * 2 * half, CAM_Z - d];
+}
+
+/* Stéblo: dlouhé, ke špičce zúžené a prohnuté do oblouku. Ohyb je
+   zapečený do geometrie, náhodné natočení instance pak rozhodí
+   směry, takže se tráva neklaní všechna na jednu stranu.           */
+function bladeGeometry() {
+  const SEG = 7;
+  const g = new THREE.PlaneGeometry(0.030, BLADE_H, 1, SEG);
+  g.translate(0, BLADE_H / 2, 0);
+  const pos = g.attributes.position;
+  const col = new Float32Array(pos.count * 3);
+  const base = new THREE.Color(0x22380f);   // u kořene skoro bez světla
+  const tip  = new THREE.Color(0x8fae52);
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    // bez ořezu vyjde na krajní řadě k = 1.0000001 a Math.pow(záporné, 0.55) je NaN
+    const k = Math.min(1, Math.max(0, pos.getY(i) / BLADE_H));
+    pos.setX(i, pos.getX(i) * Math.pow(1 - k, 0.55));   // špička do ostra
+    pos.setY(i, pos.getY(i) * (1 - 0.18 * k * k));      // oblouk zkracuje výšku
+    pos.setZ(i, Math.pow(k, 1.7) * 0.30);
+    c.copy(base).lerp(tip, Math.pow(k, 0.75));
+    col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+const grassMat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  side: THREE.DoubleSide,
+  roughness: 0.95,
+  metalness: 0
+});
+
+const wind = { value: 0 };
+grassMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime = wind;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nuniform float uTime;')
+    .replace('#include <begin_vertex>', `
+      #include <begin_vertex>
+      float bh = clamp(transformed.y / ${BLADE_H.toFixed(3)}, 0.0, 1.0);
+      vec3 ip = vec3(instanceMatrix[3][0], instanceMatrix[3][1], instanceMatrix[3][2]);
+      // poryv: pomalá vlna, která běží krajinou, plus drobné chvění
+      float gust = sin(uTime * 0.42 + ip.x * 0.16 + ip.z * 0.11) * 0.5 + 0.5;
+      float w = sin(uTime * 1.4 + ip.x * 0.55 + ip.z * 0.8) * 0.6
+              + sin(uTime * 3.1 + ip.x * 1.7 - ip.z * 1.1) * 0.25;
+      float amp = (0.35 + gust * 0.85) * bh * bh;
+      transformed.x += w * amp * 0.20;
+      transformed.z += w * amp * 0.09;
+    `);
+
+  /* Prosvícení stébel. V protisvětle je tráva hlavně průsvitná, ne
+     odražená, a bez toho vypadá jako plastová. Levné napodobení:
+     přičti barvu stébla podle toho, jak moc se díváš proti slunci. */
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nuniform float uTrans;')
+    .replace('#include <opaque_fragment>', `
+      #if NUM_DIR_LIGHTS > 0
+        vec3 L = normalize(directionalLights[0].direction);
+        float toward = clamp(dot(normalize(vViewPosition), -L), 0.0, 1.0);
+        float thru   = clamp(dot(normalize(-vNormal), L) * 0.5 + 0.5, 0.0, 1.0);
+        outgoingLight += vColor.rgb * directionalLights[0].color
+                       * pow(toward, 2.5) * thru * uTrans;
+      #endif
+      #include <opaque_fragment>
+    `);
+  shader.uniforms.uTrans = { value: 1.15 };
+};
+
+const grass = new THREE.InstancedMesh(bladeGeometry(), grassMat, BLADES);
+grass.frustumCulled = false;
+{
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const p = new THREE.Vector3();
+  const s = new THREE.Vector3();
+  const c = new THREE.Color();
+  // trsy: náhodně rozházená stébla vypadají jako koberec, tráva roste ve shlucích
+  const CLUMPS = Math.round(BLADES / 26);
+  const clump = [];
+  for (let i = 0; i < CLUMPS; i++) {
+    // kamera je pevná, tak sázíme jen do klínu, který je vidět;
+    // rozprostřít stejný počet stébel dokola by znamenalo řídkou trávu
+    const [x, z] = wedge();
+    clump.push([x, z, 0.75 + Math.random() * 0.55]);
+  }
+  for (let i = 0; i < BLADES; i++) {
+    const [cx, cz, vigor] = clump[(Math.random() * CLUMPS) | 0];
+    const x = cx + (Math.random() - 0.5) * 1.5;
+    const z = cz + (Math.random() - 0.5) * 1.5;
+    p.set(x, GROUND_Y + terrain(x, z) - 0.03, z);
+    e.set((Math.random() - 0.5) * 0.55, Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.55);
+    q.setFromEuler(e);
+    s.set(0.7 + Math.random() * 0.6, vigor * (0.45 + Math.random() * 1.25), 1);
+    m.compose(p, q, s);
+    grass.setMatrixAt(i, m);
+
+    // většina zelená, část do žluta, pár suchých stébel
+    const dry = Math.random();
+    if (dry > 0.9)      c.setHSL(0.12 + Math.random() * 0.03, 0.36, 0.38);
+    else if (dry > 0.6) c.setHSL(0.19 + Math.random() * 0.03, 0.44, 0.31);
+    else                c.setHSL(0.24 + (Math.random() - 0.5) * 0.05, 0.40 + Math.random() * 0.22, 0.19 + Math.random() * 0.13);
+    // nízkofrekvenční skvrnitost: souvislé tmavší a světlejší plochy,
+    // bez toho je louka jednolitý koberec jedné barvy
+    const patch = 0.55 + 0.75 * noise2(x * 0.13, z * 0.13);
+    c.multiplyScalar(patch);
+    grass.setColorAt(i, c);
+  }
+}
+grass.instanceMatrix.needsUpdate = true;
+scene.add(grass);
+
+/* Kvítka: dva zkřížené obdélníky s vygenerovanou texturou. Billboard
+   by se při otáčení scény protáčel, křížek drží tvar z každé strany. */
+function flowerTexture() {
+  const S = 64;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const x = cv.getContext('2d');
+  x.translate(S / 2, S / 2);
+  for (let i = 0; i < 5; i++) {
+    x.rotate(Math.PI * 2 / 5);
+    const g = x.createRadialGradient(0, -S * 0.24, 0, 0, -S * 0.24, S * 0.20);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.7, '#fdf1f2');
+    g.addColorStop(1, '#f0cdd4');
+    x.fillStyle = g;
+    x.beginPath();
+    x.ellipse(0, -S * 0.24, S * 0.13, S * 0.19, 0, 0, Math.PI * 2);
+    x.fill();
+  }
+  x.fillStyle = '#e8c25c';
+  x.beginPath();
+  x.arc(0, 0, S * 0.09, 0, Math.PI * 2);
+  x.fill();
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+{
+  const q1 = new THREE.PlaneGeometry(0.15, 0.15);
+  const q2 = q1.clone().rotateY(Math.PI / 2);
+  const petals = mergeTwo(q1, q2);
+  const fmat = new THREE.MeshStandardMaterial({
+    map: flowerTexture(), transparent: true, alphaTest: 0.5,
+    side: THREE.DoubleSide, roughness: 0.9, metalness: 0
+  });
+  const flowers = new THREE.InstancedMesh(petals, fmat, FLOWERS);
+  flowers.frustumCulled = false;
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  const p = new THREE.Vector3(), s = new THREE.Vector3();
+  for (let i = 0; i < FLOWERS; i++) {
+    const [x, z] = wedge();
+    p.set(x, GROUND_Y + terrain(x, z) + 0.20 + Math.random() * 0.28, z);
+    e.set((Math.random() - 0.5) * 0.5, Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5);
+    q.setFromEuler(e);
+    const k = 0.7 + Math.random() * 0.7;
+    s.set(k, k, k);
+    m.compose(p, q, s);
+    flowers.setMatrixAt(i, m);
+  }
+  flowers.instanceMatrix.needsUpdate = true;
+  scene.add(flowers);
+}
+
+// spojení dvou jednoduchých geometrií bez importu BufferGeometryUtils
+function mergeTwo(a, b) {
+  const g = new THREE.BufferGeometry();
+  for (const name of ['position', 'normal', 'uv']) {
+    const A = a.attributes[name], B = b.attributes[name];
+    const arr = new Float32Array(A.array.length + B.array.length);
+    arr.set(A.array, 0);
+    arr.set(B.array, A.array.length);
+    g.setAttribute(name, new THREE.BufferAttribute(arr, A.itemSize));
+  }
+  const ai = a.index.array, bi = b.index.array;
+  const off = a.attributes.position.count;
+  const idx = new Uint16Array(ai.length + bi.length);
+  idx.set(ai, 0);
+  for (let i = 0; i < bi.length; i++) idx[ai.length + i] = bi[i] + off;
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return g;
+}
+
+/* --------------------------- světla ---------------------------- */
+// nízké teplé slunce zezadu, aby tráva svítila skrz
+const sun = new THREE.DirectionalLight(0xffe0b0, 2.2);
+sun.position.set(-7, 2.6, -9);
+scene.add(sun);
+
+scene.add(new THREE.HemisphereLight(0xdfe8ea, 0x3c4a26, 0.38));
+
+const key = new THREE.DirectionalLight(0xfff6e8, 0.25);
+key.position.set(3, 5, 6);
+scene.add(key);
+
+scene.add(new THREE.AmbientLight(0xd8e2e6, 0.08));
+
+/* ------------------------- animace ----------------------------- */
+const clock = new THREE.Clock();
+
+window.__dbg = { scene, camera, THREE };
+
+function frame() {
+  // při prefers-reduced-motion se vítr zastaví a tráva zůstane stát
+  if (!reduceMotion) wind.value = clock.getElapsedTime();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+
+/* na úzkých displejích je limitem šířka, ne výška: odjeď kamerou dál,
+   ať je vidět stejný kus louky jako na širokém okně */
+function fit() {
+  const vw = Math.max(1, innerWidth), vh = Math.max(1, innerHeight);
+  const aspect = vw / vh;
+  camera.aspect = aspect;
+  camera.position.z = CAM_Z * Math.max(1, 0.62 / aspect);
+  camera.lookAt(0, 0.05, 0);
+  // mlha začíná až kus před kamerou, aby popředí zůstalo ostré
+  scene.fog.near = camera.position.z + 1;
+  scene.fog.far  = camera.position.z + 23;
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(true);
+  renderer.setSize(vw, vh);
+  refreshSky();
+}
+addEventListener('resize', fit);
+fit();
+</script>
+</body>
+</html>
