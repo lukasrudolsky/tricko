@@ -46,14 +46,16 @@ const CFG = {
   floatSpeed: 0.65,
   sway:       0.30,   // rozkyv kolem svislé osy v radiánech
   swaySpeed:  0.42,
-  puff:       0.30,   // hloubka nafouknutí, celková tloušťka je dvojnásobek
+  puff:       0.34,   // hloubka nafouknutí, celková tloušťka je dvojnásobek
+  hemBand:    0.007,  // vystouplý obroubený lem po obvodu
+  droop:      0.085,  // o kolik se svěsí konce rukávů
   wave:       0.045,  // vlnění látky, násobí se výškovou mapou
   waveSpeed:  1.15,
   fold:       0.055,  // hloubka náhodných záhybů, ty se pomalu přelévají
   drape:      0.105,  // hloubka skutečného splývání vytaženého z fotky
   weave:      0.26,   // síla pleteniny v normálové mapě
   silh:       0.030,
-  hem:        0.100,  // obroubená hrana: o kolik obě poloviny přejdou přes obrys  // rozvlnění obrysu, hlavně lemu a rukávů
+  hem:        0.200,  // obroubená hrana: o kolik obě poloviny přejdou přes obrys  // rozvlnění obrysu, hlavně lemu a rukávů
   thru:       0.055,  // prosvícení bavlny sluncem zezadu
   sunRim:     0.62,   // slunce obtahující hranu látky proti světlu
   rim:        0.085,  // světlo z oblohy na vlasu látky po obrysu
@@ -621,6 +623,8 @@ function shellMaterial(sign, tex, drape) {
     shader.uniforms.uDrapeAmp = { value: CFG.drape };
     shader.uniforms.uSilh   = { value: CFG.silh };
     shader.uniforms.uHem    = { value: CFG.hem };
+    shader.uniforms.uHemBand = { value: CFG.hemBand };
+    shader.uniforms.uDroop  = { value: CFG.droop };
     shader.uniforms.uThru   = { value: CFG.thru };
     shader.uniforms.uRim    = { value: CFG.rim };
     shader.uniforms.uSunRim = { value: CFG.sunRim };
@@ -632,7 +636,7 @@ function shellMaterial(sign, tex, drape) {
       .replace('#include <common>', `
         #include <common>
         uniform sampler2D uHeight, uDrape;
-        uniform float uAmp, uSign, uWave, uTime, uFold, uSilh, uDrapeAmp, uHem;
+        uniform float uAmp, uSign, uWave, uTime, uFold, uSilh, uDrapeAmp, uHem, uHemBand, uDroop;
         uniform vec2 uSize;
         varying float vThick;
         float puff(vec2 q) { return texture2D(uHeight, q).r; }
@@ -672,9 +676,29 @@ function shellMaterial(sign, tex, drape) {
              nule, nemá ten prstenec čím promítat a z profilu jím
              prosvítá pozadí.                                          */
           float hem = uHem * pow(max(1.0 - k, 0.0), 8.0);
-          return uAmp * pow(max(k, 0.0), 1.15) - hem
+          /* Průřez tělesa, ne čočky. Mocnina vzdálenosti dávala tvar
+             polštáře: uprostřed vršek, ke kraji pozvolna do nuly. Oděv na
+             těle je trubka — plocha nahoře, u kraje se zakulatí a spadne.
+             Kružnicový profil to dá i rukávům: jsou užší, takže v mapě
+             nedosáhnou na jedničku, ale kružnice je zvedne na dvě
+             třetiny výšky trupu a z plochých placek jsou válce.        */
+          float kk = max(k, 0.0);
+          /* Parabola k·(2−k) místo kružnice. Kružnice stojí u obrysu
+             kolmo a z té stěny je z boku vroubkovaný lem a v profilu
+             skuliny — obě poloviny se u ní míjejí. Parabola dá stejnou
+             plnost uprostřed a rukávům, ale u kraje má konečný sklon.  */
+          float body = pow(kk * (2.0 - kk), 1.1);
+          // obroubený lem: vystouplý proužek kousek od okraje
+          float band = uHemBand * exp(-pow((kk - 0.13) / 0.02, 2.0));
+          /* Záhyby, vlnění i splývání se na stěně u obrysu vypnou úplně.
+             Stěna stojí skoro kolmo a každý hrbol na ní tlačí přední
+             polovinu na jednu stranu a zadní na druhou — mezi nimi se
+             otevře skulina a z boku z toho jsou vroubky. Uvnitř, kde už
+             plocha leží, se hrboly zase pustí naplno.                  */
+          float inner = smoothstep(0.0, 0.30, kk);   // 'flat' je v GLSL vyhrazené
+          return uAmp * body + band - hem
                + ((texture2D(uDrape, q).r - 0.5) * uDrapeAmp
-                  + ripple(p) * uWave + folds(p) * uFold) * k;
+                  + ripple(p) * uWave + folds(p) * uFold) * inner;
         }
       `)
       .replace('#include <beginnormal_vertex>', `
@@ -702,6 +726,13 @@ function shellMaterial(sign, tex, drape) {
         vec2 wob = vec2(folds(position.xy + vec2(7.3, 2.1)),
                         folds(position.xy + vec2(19.7, 5.5)));
         vec3 transformed = vec3(position.xy + wob * uSilh * edge, position.z + zz);
+        /* Rukávy visí. Fotka je z rovné podložky, kde rukávy trčí do
+           stran; tričko ve vzduchu je nese jen ramenem a konce klesnou.
+           Posun roste ke špičkám rukávů a jen v horní polovině dílu.  */
+        float arm = smoothstep(0.58, 1.0, abs(position.x) / (uSize.x * 0.5))
+                  * smoothstep(0.50, 0.72, uv.y);
+        transformed.y -= uDroop * arm;
+        transformed.z += uSign * 0.02 * arm;
       `);
 
     /* Prosvícení a obrysové světlo. Slunce svítí zezadu, tenká místa
@@ -711,7 +742,7 @@ function shellMaterial(sign, tex, drape) {
       .replace('#include <common>', `
         #include <common>
         uniform vec3 uThruColor, uRimColor, uSunRimColor;
-        uniform float uThru, uRim, uSunRim;
+        uniform float uThru, uRim, uSunRim, uSign;
         varying float vThick;
       `)
       .replace('#include <lights_physical_fragment>', `
@@ -723,6 +754,16 @@ function shellMaterial(sign, tex, drape) {
       `)
       .replace('#include <map_fragment>', `
         #include <map_fragment>
+        /* Výstřih. Zezadu je límec plný, zepředu je u krku otvor a v něm
+           je vidět vnitřek zadního dílu i s etiketou — přesně tak to má
+           skutečné tričko. Otvor je elipsa na horním okraji, kolem něj se
+           látka ztmaví do žebra límce.                                 */
+        if (uSign < 0.0) {
+          vec2 nd = (vMapUv - vec2(0.5, 0.975)) / vec2(0.100, 0.068);
+          float nr = dot(nd, nd);
+          if (nr < 1.0) discard;
+          diffuseColor.rgb *= mix(0.55, 1.0, smoothstep(1.0, 1.45, nr));
+        }
         /* Obrys ve fotce je odmíchaný do bílého pozadí. Na čelním
            pohledu to nevadí, ale otočené tričko ten proužek roztáhne
            přes celý bok a vypadá to jako šedý plastový lem. Krajní
@@ -753,8 +794,12 @@ function shellMaterial(sign, tex, drape) {
           // vypadá jako plast, vlas bavlny světlo rozptýlí do šířky
           float edge = pow(1.0 - clamp(abs(dot(normal, Vv)), 0.0, 1.0), 1.6);
           float toSun = clamp(dot(normal, normalize(directionalLights[0].direction)), 0.0, 1.0);
+          /* Na stěně u obrysu se obtažení tlumí. Kružnicový profil tam
+             stojí skoro kolmo a každý záhyb by na něm chytil světlo jako
+             žebro — z boku by z toho byl vroubkovaný lem.               */
+          float wall = mix(0.25, 1.0, smoothstep(0.0, 0.14, vThick));
           outgoingLight += uSunRimColor * directionalLights[0].color
-                         * edge * toSun * uSunRim;
+                         * edge * toSun * uSunRim * wall;
         #endif
 
         /* Slabší obrys z oblohy, ten přichází shora. Kdyby se přičítal
