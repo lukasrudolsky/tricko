@@ -46,7 +46,8 @@ const CFG = {
   floatSpeed: 0.65,
   sway:       0.30,   // rozkyv kolem svislé osy v radiánech
   swaySpeed:  0.42,
-  puff:       0.34,   // hloubka nafouknutí, celková tloušťka je dvojnásobek
+  puff:       0.42,   // hloubka trupu: půl tloušťky těla, na kterém tričko visí
+  torsoW:     0.88,   // půl šířky trupu; dál do stran jsou rukávy
   hemBand:    0.007,  // vystouplý obroubený lem po obvodu
   droop:      0.085,  // o kolik se svěsí konce rukávů
   wave:       0.045,  // vlnění látky, násobí se výškovou mapou
@@ -55,7 +56,7 @@ const CFG = {
   drape:      0.105,  // hloubka skutečného splývání vytaženého z fotky
   weave:      0.26,   // síla pleteniny v normálové mapě
   silh:       0.030,
-  hem:        0.200,  // obroubená hrana: o kolik obě poloviny přejdou přes obrys  // rozvlnění obrysu, hlavně lemu a rukávů
+  hem:        0.080,  // obroubená hrana: o kolik obě poloviny přejdou přes obrys  // rozvlnění obrysu, hlavně lemu a rukávů
   thru:       0.055,  // prosvícení bavlny sluncem zezadu
   sunRim:     0.62,   // slunce obtahující hranu látky proti světlu
   rim:        0.085,  // světlo z oblohy na vlasu látky po obrysu
@@ -624,6 +625,7 @@ function shellMaterial(sign, tex, drape) {
     shader.uniforms.uSilh   = { value: CFG.silh };
     shader.uniforms.uHem    = { value: CFG.hem };
     shader.uniforms.uHemBand = { value: CFG.hemBand };
+    shader.uniforms.uTorsoW = { value: CFG.torsoW };
     shader.uniforms.uDroop  = { value: CFG.droop };
     shader.uniforms.uThru   = { value: CFG.thru };
     shader.uniforms.uRim    = { value: CFG.rim };
@@ -636,7 +638,7 @@ function shellMaterial(sign, tex, drape) {
       .replace('#include <common>', `
         #include <common>
         uniform sampler2D uHeight, uDrape;
-        uniform float uAmp, uSign, uWave, uTime, uFold, uSilh, uDrapeAmp, uHem, uHemBand, uDroop;
+        uniform float uAmp, uSign, uWave, uTime, uFold, uSilh, uDrapeAmp, uHem, uHemBand, uDroop, uTorsoW;
         uniform vec2 uSize;
         varying float vThick;
         float puff(vec2 q) { return texture2D(uHeight, q).r; }
@@ -668,35 +670,44 @@ function shellMaterial(sign, tex, drape) {
            doběhnout k obrysu naplocho. Kdyby u kraje stály svisle,
            vznikne po boku trička široká stěna, která při otočení
            chytne lesk a vypadá jako plastová hrana.                   */
+        /* Tričko na neviditelném těle. Předtím se plocha nafukovala
+           podle vzdálenosti od obrysu — z toho je polštář, zavřený po
+           celém obvodu. Oděv na těle je jinak: trup je trubka kolem
+           svislé osy, dole u lemu otevřená, po stranách sešitá; rukávy
+           jsou trubky kolem šikmé osy, přišité k ramenům a k trupu.
+           Nahoře na ramenou a u límce se obě poloviny musí potkat, to
+           hlídá vzdálenost od obrysu. Míry trupu a rukávů jsou
+           odměřené z fotky.                                           */
         float bulge(vec2 q, vec2 p) {
-          float k = puff(q);
-          /* Lem. Obě poloviny u obrysu přejdou na opačnou stranu, čímž
-             se překříží — z toho vznikne po celém okraji obroubená
-             hrana se skutečnou tloušťkou. Kdyby se potkaly jen tečně v
-             nule, nemá ten prstenec čím promítat a z profilu jím
-             prosvítá pozadí.                                          */
-          float hem = uHem * pow(max(1.0 - k, 0.0), 8.0);
-          /* Průřez tělesa, ne čočky. Mocnina vzdálenosti dávala tvar
-             polštáře: uprostřed vršek, ke kraji pozvolna do nuly. Oděv na
-             těle je trubka — plocha nahoře, u kraje se zakulatí a spadne.
-             Kružnicový profil to dá i rukávům: jsou užší, takže v mapě
-             nedosáhnou na jedničku, ale kružnice je zvedne na dvě
-             třetiny výšky trupu a z plochých placek jsou válce.        */
+          float k  = puff(q);
           float kk = max(k, 0.0);
-          /* Parabola k·(2−k) místo kružnice. Kružnice stojí u obrysu
-             kolmo a z té stěny je z boku vroubkovaný lem a v profilu
-             skuliny — obě poloviny se u ní míjejí. Parabola dá stejnou
-             plnost uprostřed a rukávům, ale u kraje má konečný sklon.  */
-          float body = pow(kk * (2.0 - kk), 1.1);
-          // obroubený lem: vystouplý proužek kousek od okraje
-          float band = uHemBand * exp(-pow((kk - 0.13) / 0.02, 2.0));
-          /* Záhyby, vlnění i splývání se na stěně u obrysu vypnou úplně.
-             Stěna stojí skoro kolmo a každý hrbol na ní tlačí přední
-             polovinu na jednu stranu a zadní na druhou — mezi nimi se
-             otevře skulina a z boku z toho jsou vroubky. Uvnitř, kde už
-             plocha leží, se hrboly zase pustí naplno.                  */
-          float inner = smoothstep(0.0, 0.30, kk);   // 'flat' je v GLSL vyhrazené
-          return uAmp * body + band - hem
+
+          // trup: parabola napříč, u bočních švů nula, dole otevřená
+          float xr = p.x / uTorsoW;
+          float torso = uAmp * max(0.0, 1.0 - xr * xr);
+          // rameno a límec: horní obrys se zavře podle vzdálenosti od kraje
+          float seal = mix(1.0, clamp(kk / 0.12, 0.0, 1.0), smoothstep(0.50, 0.62, q.y));
+          torso *= seal;
+
+          // rukáv: klín od špičky (u 0,008; v 0,58) k trupu, osa mírně
+          // stoupá k rameni, výška roste s odstupem od špičky
+          float ua = 0.5 - abs(q.x - 0.5);
+          float du = max(ua - 0.008, 0.0);
+          float vc = 0.58 + 0.305 * du;
+          float hs = 0.945 * du;
+          float t  = (q.y - vc) / max(hs, 1e-4);
+          float rs = min(0.55 * hs * uSize.y, 0.32);
+          float sleeve = (ua < 0.24 && abs(t) < 1.0) ? rs * (1.0 - t * t) : 0.0;
+
+          float body = max(torso, sleeve);
+
+          // záhyby, vlnění i splývání až na ploše, ne na švech
+          float inner = smoothstep(0.0, 0.30, kk);
+          float band  = uHemBand * exp(-pow((kk - 0.13) / 0.02, 2.0));
+          // překřížení polovin jen tam, kde se mají potkat — u lemu ne,
+          // tam je otvor
+          float hem   = uHem * pow(max(1.0 - kk, 0.0), 8.0) * step(0.12, q.y);
+          return body + band - hem
                + ((texture2D(uDrape, q).r - 0.5) * uDrapeAmp
                   + ripple(p) * uWave + folds(p) * uFold) * inner;
         }
@@ -1717,7 +1728,7 @@ const smoothstep = (e0, e1, x) => {
 
 // window.__setAngle(rad) natočí objekt na daný úhel a nechá ho stát
 window.__dbg = { scene, camera, THREE };
-window.__setAngle = (a) => { rotY = a; rotX = 0; velY = velX = 0; frozen = true; };
+window.__setAngle = (a, tx) => { rotY = a; rotX = tx || 0; velY = velX = 0; frozen = true; };
 
 function frame() {
   watchSpeed();
